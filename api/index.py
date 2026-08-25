@@ -134,7 +134,9 @@ async def send_tg_message(chat_id: int, text: str, reply_markup: dict = None):
     if reply_markup:
         payload["reply_markup"] = reply_markup
     async with httpx.AsyncClient(timeout=10.0) as client:
-        await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
+        res = await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
+        if res.status_code != 200:
+            logging.error(f"sendMessage error: {res.status_code} - {res.text}")
 
 
 async def edit_tg_message(chat_id: int, message_id: int, text: str, reply_markup: dict = None):
@@ -176,7 +178,7 @@ def cancel_keyboard():
     return {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "btn_cancel"}]]}
 
 
-# --- Reports & Account Helpers ---
+# --- Reports ---
 
 async def get_accounts_summary_lines(user_id: int) -> str:
     rows = await query_turso("SELECT bank_name, balance FROM accounts WHERE user_id = ?", [user_id])
@@ -229,12 +231,13 @@ async def build_daily_summary(user_id: int) -> str:
 
 @app.post("/api/webhook")
 @app.post("/webhook")
+@app.post("/")
 async def webhook(request: Request):
     try:
         await init_db()
         data = await request.json()
 
-        # 1. Text Input Message
+        # 1. Text Message Received
         if "message" in data:
             msg = data["message"]
             user_id = msg["from"]["id"]
@@ -248,20 +251,20 @@ async def webhook(request: Request):
                     [user_id, chat_id]
                 )
                 await query_turso("DELETE FROM user_states WHERE user_id = ?", [user_id])
-                await send_tg_message(chat_id, "👋 <b>Welcome to Money Tracker!</b>\n\nTap an option below:", main_menu_keyboard())
+                await send_tg_message(chat_id, "👋 <b>Welcome to Money Tracker!</b>\n\nTap an option below to manage your money:", main_menu_keyboard())
                 return Response(status_code=200)
 
             # Check User State
             rows = await query_turso("SELECT state FROM user_states WHERE user_id = ?", [user_id])
             state = rows[0][0] if rows and rows[0] else None
 
-            # A. Add Bank
+            # Add Bank
             if state == "AWAITING_ADD_BANK":
                 parts = text.split()
                 if len(parts) < 2:
                     await send_tg_message(chat_id, "❌ Send: <code>&lt;BankName&gt; &lt;Balance&gt;</code> (e.g. <code>CBE 5000</code>)", cancel_keyboard())
                     return Response(status_code=200)
-                bank_name = parts[0].capitalize()
+                bank_name = parts[0].strip()
                 try:
                     balance = float(parts[1])
                 except ValueError:
@@ -277,12 +280,11 @@ async def webhook(request: Request):
                 await send_tg_message(chat_id, f"✅ Account <b>{bank_name}</b> set to <b>${balance:,.2f}</b>.", main_menu_keyboard())
                 return Response(status_code=200)
 
-            # B. Spend (or Auto-detected Expense)
+            # Spend (or Direct Typing)
             if state == "AWAITING_SPEND" or state is None:
                 parts = text.split(maxsplit=2)
                 if len(parts) >= 2:
                     bank_input = parts[0]
-                    # Check if first word matches a known bank
                     accs = await query_turso(
                         "SELECT balance, bank_name FROM accounts WHERE user_id = ? AND LOWER(bank_name) = LOWER(?)",
                         [user_id, bank_input]
@@ -317,7 +319,7 @@ async def webhook(request: Request):
                             )
                             return Response(status_code=200)
 
-            # C. Income
+            # Income
             if state == "AWAITING_INCOME":
                 parts = text.split(maxsplit=2)
                 if len(parts) < 2:
@@ -359,7 +361,6 @@ async def webhook(request: Request):
                 )
                 return Response(status_code=200)
 
-            # Fallback if no command recognized
             await send_tg_message(chat_id, "Please select an option from the menu:", main_menu_keyboard())
 
         # 2. Button Callback Received
@@ -434,6 +435,18 @@ async def webhook(request: Request):
         logging.error(f"Webhook Error: {e}", exc_info=True)
 
     return Response(status_code=200)
+
+
+@app.get("/api/set_webhook")
+@app.get("/set_webhook")
+async def set_webhook(request: Request):
+    base_url = str(request.base_url).rstrip("/")
+    if base_url.startswith("http://"):
+        base_url = base_url.replace("http://", "https://")
+    webhook_url = f"{base_url}/api/webhook"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        res = await client.post(f"{TELEGRAM_API}/setWebhook", json={"url": webhook_url})
+        return res.json()
 
 
 @app.get("/api/daily_summary")
