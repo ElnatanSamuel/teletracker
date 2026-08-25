@@ -1,7 +1,6 @@
 import datetime
 import logging
 import os
-from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
 import libsql_client
@@ -32,7 +31,13 @@ def get_db_client():
     return libsql_client.create_client(url=TURSO_DB_URL, auth_token=TURSO_AUTH_TOKEN)
 
 
+_db_initialized = False
+
+
 async def init_db():
+    global _db_initialized
+    if _db_initialized:
+        return
     async with get_db_client() as client:
         await client.execute(
             """
@@ -68,6 +73,22 @@ async def init_db():
             )
         """
         )
+    _db_initialized = True
+
+
+# --- Bot Setup ---
+
+bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+
+async def ensure_initialized():
+    """Ensure DB and Bot are ready for every serverless invocation."""
+    await init_db()
+    if not getattr(bot_app, "_initialized", False):
+        await bot_app.initialize()
+
+
+app = FastAPI()
 
 
 # --- Keyboards ---
@@ -163,23 +184,7 @@ async def build_daily_summary(user_id: int) -> str:
     return msg
 
 
-# --- Bot Application Setup ---
-
-bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await init_db()
-    await bot_app.initialize()
-    yield
-    await bot_app.shutdown()
-
-
-app = FastAPI(lifespan=lifespan)
-
-
-# --- Core Logic Handlers ---
+# --- Message & Callback Logic ---
 
 async def process_telegram_update(update: Update):
     if update.message:
@@ -196,13 +201,12 @@ async def process_telegram_update(update: Update):
                 )
             await bot_app.bot.send_message(
                 chat_id=chat_id,
-                text="👋 **Welcome to Money Tracker!**\n\nTap an option below:",
+                text="👋 **Welcome to Money Tracker!**\n\nTap an option below to manage your money:",
                 reply_markup=main_menu_keyboard(),
                 parse_mode="Markdown",
             )
             return
 
-        # Check current user state
         async with get_db_client() as client:
             rs = await client.execute("SELECT state, state_data FROM users WHERE user_id = ?", [user_id])
             user_row = rs.rows[0] if rs.rows else None
@@ -210,7 +214,7 @@ async def process_telegram_update(update: Update):
         if not user_row or not user_row[0]:
             await bot_app.bot.send_message(
                 chat_id=chat_id,
-                text="Please select an action from the menu:",
+                text="Please select an option from the menu:",
                 reply_markup=main_menu_keyboard(),
             )
             return
@@ -233,7 +237,7 @@ async def process_telegram_update(update: Update):
             try:
                 balance = float(parts[1])
             except ValueError:
-                await bot_app.bot.send_message(chat_id=chat_id, text="❌ Please enter a valid number.", reply_markup=cancel_keyboard())
+                await bot_app.bot.send_message(chat_id=chat_id, text="❌ Please enter a valid numeric balance.", reply_markup=cancel_keyboard())
                 return
 
             async with get_db_client() as client:
@@ -431,24 +435,26 @@ async def process_telegram_update(update: Update):
             )
 
 
-# --- FastAPI Endpoints ---
+# --- HTTP Endpoints ---
 
 @app.post("/api/webhook")
 @app.post("/")
 async def webhook(request: Request):
+    await ensure_initialized()
     try:
         data = await request.json()
         update = Update.de_json(data, bot_app.bot)
         await process_telegram_update(update)
     except Exception as e:
-        logging.error(f"Error handling update: {e}")
+        logging.error(f"Error handling update: {e}", exc_info=True)
     return Response(status_code=200)
 
 
 @app.get("/api/set_webhook")
+@app.get("/set_webhook")
 async def set_webhook(request: Request):
+    await ensure_initialized()
     base_url = str(request.base_url).rstrip("/")
-    # Force HTTPS for Vercel
     if base_url.startswith("http://"):
         base_url = base_url.replace("http://", "https://")
     webhook_url = f"{base_url}/api/webhook"
@@ -457,7 +463,9 @@ async def set_webhook(request: Request):
 
 
 @app.get("/api/daily_summary")
+@app.get("/daily_summary")
 async def daily_summary():
+    await ensure_initialized()
     async with get_db_client() as client:
         rs = await client.execute("SELECT user_id, chat_id FROM users")
         users = rs.rows
