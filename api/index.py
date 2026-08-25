@@ -76,7 +76,13 @@ async def query_turso(sql: str, args: list = None):
         return []
 
 
+_db_initialized = False
+
+
 async def init_db():
+    global _db_initialized
+    if _db_initialized:
+        return
     await query_turso(
         """
         CREATE TABLE IF NOT EXISTS accounts (
@@ -111,9 +117,19 @@ async def init_db():
         )
         """
     )
+    # Automatic migrations for existing databases
+    try:
+        await query_turso("ALTER TABLE users ADD COLUMN state TEXT")
+    except Exception:
+        pass
+    try:
+        await query_turso("ALTER TABLE users ADD COLUMN state_data TEXT")
+    except Exception:
+        pass
+    _db_initialized = True
 
 
-# --- Direct Telegram Helpers (HTML Mode) ---
+# --- Direct Telegram Helpers ---
 
 async def send_tg_message(chat_id: int, text: str, reply_markup: dict = None):
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
@@ -227,7 +243,7 @@ async def webhook(request: Request):
         await init_db()
         data = await request.json()
 
-        # 1. Text Message Received
+        # Handle Text Input
         if "message" in data:
             msg = data["message"]
             user_id = msg["from"]["id"]
@@ -240,10 +256,9 @@ async def webhook(request: Request):
                     "ON CONFLICT(user_id) DO UPDATE SET chat_id = excluded.chat_id, state = NULL, state_data = NULL",
                     [user_id, chat_id]
                 )
-                await send_tg_message(chat_id, "👋 <b>Welcome to Money Tracker!</b>\n\nTap an option below to get started:", main_menu_keyboard())
+                await send_tg_message(chat_id, "👋 <b>Welcome to Money Tracker!</b>\n\nTap an option below to manage your money:", main_menu_keyboard())
                 return Response(status_code=200)
 
-            # Check User State in Database
             rows = await query_turso("SELECT state, state_data FROM users WHERE user_id = ?", [user_id])
             user_row = rows[0] if rows else None
 
@@ -333,7 +348,7 @@ async def webhook(request: Request):
                     main_menu_keyboard()
                 )
 
-        # 2. Button Callback Received
+        # Handle Button Callbacks
         elif "callback_query" in data:
             cb = data["callback_query"]
             cb_id = cb["id"]
@@ -345,7 +360,11 @@ async def webhook(request: Request):
             await answer_tg_callback(cb_id)
 
             if cb_data == "btn_addbank":
-                await query_turso("UPDATE users SET state = 'AWAITING_ADD_BANK', state_data = NULL WHERE user_id = ?", [user_id])
+                await query_turso(
+                    "INSERT INTO users (user_id, chat_id, state, state_data) VALUES (?, ?, 'AWAITING_ADD_BANK', NULL) "
+                    "ON CONFLICT(user_id) DO UPDATE SET chat_id = excluded.chat_id, state = 'AWAITING_ADD_BANK', state_data = NULL",
+                    [user_id, chat_id]
+                )
                 await edit_tg_message(
                     chat_id,
                     message_id,
@@ -369,7 +388,11 @@ async def webhook(request: Request):
 
             elif cb_data.startswith("spend_bank:"):
                 bank_name = cb_data.split(":", 1)[1]
-                await query_turso("UPDATE users SET state = 'AWAITING_SPEND', state_data = ? WHERE user_id = ?", [bank_name, user_id])
+                await query_turso(
+                    "INSERT INTO users (user_id, chat_id, state, state_data) VALUES (?, ?, 'AWAITING_SPEND', ?) "
+                    "ON CONFLICT(user_id) DO UPDATE SET chat_id = excluded.chat_id, state = 'AWAITING_SPEND', state_data = excluded.state_data",
+                    [user_id, chat_id, bank_name]
+                )
                 await edit_tg_message(
                     chat_id,
                     message_id,
@@ -379,11 +402,15 @@ async def webhook(request: Request):
 
             elif cb_data.startswith("income_bank:"):
                 bank_name = cb_data.split(":", 1)[1]
-                await query_turso("UPDATE users SET state = 'AWAITING_INCOME', state_data = ? WHERE user_id = ?", [bank_name, user_id])
+                await query_turso(
+                    "INSERT INTO users (user_id, chat_id, state, state_data) VALUES (?, ?, 'AWAITING_INCOME', ?) "
+                    "ON CONFLICT(user_id) DO UPDATE SET chat_id = excluded.chat_id, state = 'AWAITING_INCOME', state_data = excluded.state_data",
+                    [user_id, chat_id, bank_name]
+                )
                 await edit_tg_message(
                     chat_id,
                     message_id,
-                    f"💰 <b>Selected:</b> <code>{bank_name}</code>\n\nSend the <b>amount</b> and <b>source</b>.\n<i>Example:</i> <code>500 Freelance gig</code>",
+                    f"💰 <b>Selected:</b> <code>{bank_name}</code>\n\nSend the <b>amount</b> and <b>source</b>.\n<i>Example:</i> <code>500 Freelance project</code>",
                     cancel_keyboard()
                 )
 
