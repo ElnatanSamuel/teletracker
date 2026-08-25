@@ -113,22 +113,26 @@ async def init_db():
     )
 
 
-# --- Direct Telegram Helpers ---
+# --- Direct Telegram Helpers (HTML Mode) ---
 
 async def send_tg_message(chat_id: int, text: str, reply_markup: dict = None):
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     if reply_markup:
         payload["reply_markup"] = reply_markup
     async with httpx.AsyncClient(timeout=10.0) as client:
-        await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
+        res = await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
+        if res.status_code != 200:
+            logging.error(f"Telegram sendMessage error: {res.status_code} - {res.text}")
 
 
 async def edit_tg_message(chat_id: int, message_id: int, text: str, reply_markup: dict = None):
-    payload = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "Markdown"}
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML"}
     if reply_markup:
         payload["reply_markup"] = reply_markup
     async with httpx.AsyncClient(timeout=10.0) as client:
-        await client.post(f"{TELEGRAM_API}/editMessageText", json=payload)
+        res = await client.post(f"{TELEGRAM_API}/editMessageText", json=payload)
+        if res.status_code != 200:
+            logging.error(f"Telegram editMessageText error: {res.status_code} - {res.text}")
 
 
 async def answer_tg_callback(callback_query_id: str):
@@ -178,10 +182,10 @@ async def get_bank_selection_keyboard(user_id: int, action_prefix: str):
 async def get_balances_text(user_id: int) -> str:
     rows = await query_turso("SELECT bank_name, balance FROM accounts WHERE user_id = ?", [user_id])
     if not rows:
-        return "🏦 **No accounts found.** Tap 'Add / Edit Bank' to add one."
+        return "🏦 <b>No accounts found.</b> Tap 'Add / Edit Bank' to add one."
     total = sum(float(r[1]) for r in rows if r[1] is not None)
-    lines = [f"• **{r[0]}**: ${float(r[1]):,.2f}" for r in rows if r[1] is not None]
-    return "🏦 **Current Balances:**\n\n" + "\n".join(lines) + f"\n\n**Total Net Worth:** `${total:,.2f}`"
+    lines = [f"• <b>{r[0]}</b>: ${float(r[1]):,.2f}" for r in rows if r[1] is not None]
+    return "🏦 <b>Current Balances:</b>\n\n" + "\n".join(lines) + f"\n\n<b>Total Net Worth:</b> <code>${total:,.2f}</code>"
 
 
 async def build_daily_summary(user_id: int) -> str:
@@ -197,24 +201,24 @@ async def build_daily_summary(user_id: int) -> str:
     net = earned - spent
     total_balance = sum(float(a[1]) for a in accounts if a[1] is not None)
 
-    msg = f"📊 **Daily Summary ({today_str})**\n\n• **Spent Today:** -${spent:,.2f}\n• **Income Today:** +${earned:,.2f}\n• **Net Change:** {'+$' if net >= 0 else '-$'}{abs(net):,.2f}\n\n"
+    msg = f"📊 <b>Daily Summary ({today_str})</b>\n\n• <b>Spent Today:</b> -${spent:,.2f}\n• <b>Income Today:</b> +${earned:,.2f}\n• <b>Net Change:</b> {'+$' if net >= 0 else '-$'}{abs(net):,.2f}\n\n"
     if txs:
-        msg += "**Today's Transactions:**\n"
+        msg += "<b>Today's Transactions:</b>\n"
         for bank, tx_type, amt, desc in txs:
             sign = "-" if tx_type == "expense" else "+"
-            msg += f"  • `{sign}${float(amt):,.2f}` ({bank}) - {desc}\n"
+            msg += f"  • <code>{sign}${float(amt):,.2f}</code> ({bank}) - {desc}\n"
         msg += "\n"
     else:
-        msg += "_No transactions recorded today._\n\n"
+        msg += "<i>No transactions recorded today.</i>\n\n"
 
-    msg += "**Balances:**\n"
+    msg += "<b>Balances:</b>\n"
     for bank, bal in accounts:
         msg += f"  • {bank}: ${float(bal):,.2f}\n"
-    msg += f"**Total Net Worth:** `${total_balance:,.2f}`"
+    msg += f"<b>Total Net Worth:</b> <code>${total_balance:,.2f}</code>"
     return msg
 
 
-# --- Endpoints ---
+# --- Webhook Endpoint ---
 
 @app.post("/api/webhook")
 @app.post("/webhook")
@@ -223,6 +227,7 @@ async def webhook(request: Request):
         await init_db()
         data = await request.json()
 
+        # 1. Text Message Received
         if "message" in data:
             msg = data["message"]
             user_id = msg["from"]["id"]
@@ -235,9 +240,10 @@ async def webhook(request: Request):
                     "ON CONFLICT(user_id) DO UPDATE SET chat_id = excluded.chat_id, state = NULL, state_data = NULL",
                     [user_id, chat_id]
                 )
-                await send_tg_message(chat_id, "👋 **Welcome to Money Tracker!**\n\nTap an option below:", main_menu_keyboard())
+                await send_tg_message(chat_id, "👋 <b>Welcome to Money Tracker!</b>\n\nTap an option below to get started:", main_menu_keyboard())
                 return Response(status_code=200)
 
+            # Check User State in Database
             rows = await query_turso("SELECT state, state_data FROM users WHERE user_id = ?", [user_id])
             user_row = rows[0] if rows else None
 
@@ -250,7 +256,7 @@ async def webhook(request: Request):
             if state == "AWAITING_ADD_BANK":
                 parts = text.split()
                 if len(parts) < 2:
-                    await send_tg_message(chat_id, "❌ Send: `<BankName> <Balance>` (e.g. `CBE 5000`)", cancel_keyboard())
+                    await send_tg_message(chat_id, "❌ Send: <code>&lt;BankName&gt; &lt;Balance&gt;</code> (e.g. <code>CBE 5000</code>)", cancel_keyboard())
                     return Response(status_code=200)
                 bank_name = parts[0].capitalize()
                 try:
@@ -265,7 +271,7 @@ async def webhook(request: Request):
                     [user_id, bank_name, balance]
                 )
                 await query_turso("UPDATE users SET state = NULL, state_data = NULL WHERE user_id = ?", [user_id])
-                await send_tg_message(chat_id, f"✅ Account **{bank_name}** set to **${balance:,.2f}**.", main_menu_keyboard())
+                await send_tg_message(chat_id, f"✅ Account <b>{bank_name}</b> set to <b>${balance:,.2f}</b>.", main_menu_keyboard())
 
             elif state == "AWAITING_SPEND":
                 bank_name = state_data
@@ -293,7 +299,7 @@ async def webhook(request: Request):
                 await query_turso("UPDATE users SET state = NULL, state_data = NULL WHERE user_id = ?", [user_id])
                 await send_tg_message(
                     chat_id,
-                    f"💸 **Expense Logged!**\n• {bank_name}: -${amount:,.2f}\n• Reason: {reason}\n• Remaining: `${new_balance:,.2f}`",
+                    f"💸 <b>Expense Logged!</b>\n• Account: <b>{bank_name}</b>\n• Amount: <b>-${amount:,.2f}</b>\n• Reason: {reason}\n• Remaining Balance: <b>${new_balance:,.2f}</b>",
                     main_menu_keyboard()
                 )
 
@@ -323,10 +329,11 @@ async def webhook(request: Request):
                 await query_turso("UPDATE users SET state = NULL, state_data = NULL WHERE user_id = ?", [user_id])
                 await send_tg_message(
                     chat_id,
-                    f"💰 **Income Logged!**\n• {bank_name}: +${amount:,.2f}\n• Source: {source}\n• New Balance: `${new_balance:,.2f}`",
+                    f"💰 <b>Income Logged!</b>\n• Account: <b>{bank_name}</b>\n• Amount: <b>+${amount:,.2f}</b>\n• Source: {source}\n• New Balance: <b>${new_balance:,.2f}</b>",
                     main_menu_keyboard()
                 )
 
+        # 2. Button Callback Received
         elif "callback_query" in data:
             cb = data["callback_query"]
             cb_id = cb["id"]
@@ -339,31 +346,46 @@ async def webhook(request: Request):
 
             if cb_data == "btn_addbank":
                 await query_turso("UPDATE users SET state = 'AWAITING_ADD_BANK', state_data = NULL WHERE user_id = ?", [user_id])
-                await edit_tg_message(chat_id, message_id, "🏦 **Add / Update Bank**\n\nSend: `<BankName> <Balance>`\n_Example:_ `CBE 5000`", cancel_keyboard())
+                await edit_tg_message(
+                    chat_id,
+                    message_id,
+                    "🏦 <b>Add / Update Bank Account</b>\n\nSend: <code>&lt;BankName&gt; &lt;Balance&gt;</code>\n<i>Example:</i> <code>CBE 5000</code>",
+                    cancel_keyboard()
+                )
 
             elif cb_data == "btn_spend":
                 kb = await get_bank_selection_keyboard(user_id, "spend_bank")
                 if not kb:
-                    await edit_tg_message(chat_id, message_id, "⚠️ No accounts found. Tap **Add / Edit Bank** first.", main_menu_keyboard())
+                    await edit_tg_message(chat_id, message_id, "⚠️ No accounts found. Tap 'Add / Edit Bank' first.", main_menu_keyboard())
                 else:
-                    await edit_tg_message(chat_id, message_id, "💸 **Select account spent from:**", kb)
+                    await edit_tg_message(chat_id, message_id, "💸 <b>Select account spent from:</b>", kb)
 
             elif cb_data == "btn_income":
                 kb = await get_bank_selection_keyboard(user_id, "income_bank")
                 if not kb:
-                    await edit_tg_message(chat_id, message_id, "⚠️ No accounts found. Tap **Add / Edit Bank** first.", main_menu_keyboard())
+                    await edit_tg_message(chat_id, message_id, "⚠️ No accounts found. Tap 'Add / Edit Bank' first.", main_menu_keyboard())
                 else:
-                    await edit_tg_message(chat_id, message_id, "💰 **Select account received in:**", kb)
+                    await edit_tg_message(chat_id, message_id, "💰 <b>Select account received in:</b>", kb)
 
             elif cb_data.startswith("spend_bank:"):
                 bank_name = cb_data.split(":", 1)[1]
                 await query_turso("UPDATE users SET state = 'AWAITING_SPEND', state_data = ? WHERE user_id = ?", [bank_name, user_id])
-                await edit_tg_message(chat_id, message_id, f"💸 **Selected:** {bank_name}\n\nSend: `<Amount> <Reason>`\n_Example:_ `150 Lunch`", cancel_keyboard())
+                await edit_tg_message(
+                    chat_id,
+                    message_id,
+                    f"💸 <b>Selected:</b> <code>{bank_name}</code>\n\nSend the <b>amount</b> and <b>reason</b>.\n<i>Example:</i> <code>150 Lunch with friends</code>",
+                    cancel_keyboard()
+                )
 
             elif cb_data.startswith("income_bank:"):
                 bank_name = cb_data.split(":", 1)[1]
                 await query_turso("UPDATE users SET state = 'AWAITING_INCOME', state_data = ? WHERE user_id = ?", [bank_name, user_id])
-                await edit_tg_message(chat_id, message_id, f"💰 **Selected:** {bank_name}\n\nSend: `<Amount> <Source>`\n_Example:_ `500 Salary`", cancel_keyboard())
+                await edit_tg_message(
+                    chat_id,
+                    message_id,
+                    f"💰 <b>Selected:</b> <code>{bank_name}</code>\n\nSend the <b>amount</b> and <b>source</b>.\n<i>Example:</i> <code>500 Freelance gig</code>",
+                    cancel_keyboard()
+                )
 
             elif cb_data == "btn_balance":
                 report = await get_balances_text(user_id)
@@ -375,7 +397,7 @@ async def webhook(request: Request):
 
             elif cb_data == "btn_cancel":
                 await query_turso("UPDATE users SET state = NULL, state_data = NULL WHERE user_id = ?", [user_id])
-                await edit_tg_message(chat_id, message_id, "Action cancelled.", main_menu_keyboard())
+                await edit_tg_message(chat_id, message_id, "Action cancelled. Choose an option:", main_menu_keyboard())
 
     except Exception as e:
         logging.error(f"Webhook Error: {e}", exc_info=True)
