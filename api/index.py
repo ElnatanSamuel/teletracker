@@ -214,10 +214,10 @@ async def build_daily_summary(user_id: int) -> str:
     return msg
 
 
-# --- Webhook Endpoint ---
+# --- Endpoints ---
 
 @app.post("/api/webhook")
-@app.post("/")
+@app.post("/webhook")
 async def webhook(request: Request):
     try:
         await init_db()
@@ -383,6 +383,21 @@ async def webhook(request: Request):
     return Response(status_code=200)
 
 
+@app.get("/api/daily_summary")
+@app.get("/daily_summary")
+async def daily_summary():
+    await init_db()
+    users = await query_turso("SELECT user_id, chat_id FROM users")
+    for user_id, chat_id in users:
+        try:
+            report = await build_daily_summary(int(user_id))
+            await send_tg_message(int(chat_id), report, main_menu_keyboard())
+        except Exception as e:
+            logging.error(f"Error sending summary to {user_id}: {e}")
+    return {"status": "success", "count": len(users)}
+
+
+@app.get("/")
 @app.get("/api/webhook")
-async def health_check():
-    return {"status": "ok", "message": "Webhook is running"}
+async def root():
+    return {"status": "ok", "message": "Money Tracker Bot is running"}
