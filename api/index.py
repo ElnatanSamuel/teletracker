@@ -237,7 +237,7 @@ async def webhook(request: Request):
         await init_db()
         data = await request.json()
 
-        # 1. Text Message Received
+        # 1. Handle Text Messages
         if "message" in data:
             msg = data["message"]
             user_id = msg["from"]["id"]
@@ -363,7 +363,7 @@ async def webhook(request: Request):
 
             await send_tg_message(chat_id, "Please select an option from the menu:", main_menu_keyboard())
 
-        # 2. Button Callback Received
+        # 2. Handle Button Clicks
         elif "callback_query" in data:
             cb = data["callback_query"]
             cb_id = cb["id"]
@@ -437,18 +437,6 @@ async def webhook(request: Request):
     return Response(status_code=200)
 
 
-@app.get("/api/set_webhook")
-@app.get("/set_webhook")
-async def set_webhook(request: Request):
-    base_url = str(request.base_url).rstrip("/")
-    if base_url.startswith("http://"):
-        base_url = base_url.replace("http://", "https://")
-    webhook_url = f"{base_url}/api/webhook"
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        res = await client.post(f"{TELEGRAM_API}/setWebhook", json={"url": webhook_url})
-        return res.json()
-
-
 @app.get("/api/daily_summary")
 @app.get("/daily_summary")
 async def daily_summary():
@@ -465,5 +453,6 @@ async def daily_summary():
 
 @app.get("/")
 @app.get("/api/webhook")
+@app.get("/webhook")
 async def root():
     return {"status": "ok", "message": "Money Tracker Bot is running"}
