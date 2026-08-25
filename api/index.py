@@ -1,7 +1,6 @@
 import datetime
 import logging
 import os
-from collections import deque
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
 import httpx
@@ -22,16 +21,6 @@ else:
     TURSO_DB_URL = RAW_DB_URL
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-
-# Ring buffer to store last 25 events for /api/debug
-DEBUG_LOGS = deque(maxlen=25)
-
-
-def log_debug(msg: str):
-    logging.info(msg)
-    timestamp = datetime.datetime.utcnow().strftime("%H:%M:%S")
-    DEBUG_LOGS.append(f"[{timestamp}] {msg}")
-
 
 app = FastAPI()
 
@@ -78,7 +67,7 @@ async def query_turso(sql: str, args: list = None):
         if "results" in res_data and len(res_data["results"]) > 0:
             result_obj = res_data["results"][0]
             if result_obj.get("type") == "error":
-                raise RuntimeError(f"Turso SQL Error: {result_obj.get('error')}")
+                raise RuntimeError(f"Turso Error: {result_obj.get('error')}")
             response = result_obj.get("response", {}).get("result", {})
             rows = []
             for r in response.get("rows", []):
@@ -136,7 +125,6 @@ async def init_db():
         """
     )
     _db_initialized = True
-    log_debug("Database tables verified.")
 
 
 # --- Direct Telegram Helpers ---
@@ -146,9 +134,7 @@ async def send_tg_message(chat_id: int, text: str, reply_markup: dict = None):
     if reply_markup:
         payload["reply_markup"] = reply_markup
     async with httpx.AsyncClient(timeout=10.0) as client:
-        res = await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
-        if res.status_code != 200:
-            log_debug(f"sendMessage Failed: {res.status_code} - {res.text}")
+        await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
 
 
 async def edit_tg_message(chat_id: int, message_id: int, text: str, reply_markup: dict = None):
@@ -158,8 +144,6 @@ async def edit_tg_message(chat_id: int, message_id: int, text: str, reply_markup
     async with httpx.AsyncClient(timeout=10.0) as client:
         res = await client.post(f"{TELEGRAM_API}/editMessageText", json=payload)
         if res.status_code != 200:
-            log_debug(f"editMessageText Failed ({res.status_code}), falling back to sendMessage.")
-            # Fallback to sending a new message if edit fails
             await send_tg_message(chat_id, text, reply_markup)
 
 
@@ -192,20 +176,15 @@ def cancel_keyboard():
     return {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "btn_cancel"}]]}
 
 
-async def get_bank_selection_keyboard(user_id: int, action_prefix: str):
-    banks = await query_turso("SELECT bank_name, balance FROM accounts WHERE user_id = ?", [user_id])
-    if not banks:
-        return None
-    buttons = []
-    for row in banks:
-        name = str(row[0])
-        bal = float(row[1]) if row[1] is not None else 0.0
-        buttons.append([{"text": f"{name} (${bal:,.2f})", "callback_data": f"{action_prefix}:{name}"}])
-    buttons.append([{"text": "❌ Cancel", "callback_data": "btn_cancel"}])
-    return {"inline_keyboard": buttons}
+# --- Reports & Account Helpers ---
 
+async def get_accounts_summary_lines(user_id: int) -> str:
+    rows = await query_turso("SELECT bank_name, balance FROM accounts WHERE user_id = ?", [user_id])
+    if not rows:
+        return "<i>No accounts added yet.</i>"
+    lines = [f"• <b>{r[0]}</b>: ${float(r[1]):,.2f}" for r in rows if r[1] is not None]
+    return "\n".join(lines)
 
-# --- Reports ---
 
 async def get_balances_text(user_id: int) -> str:
     rows = await query_turso("SELECT bank_name, balance FROM accounts WHERE user_id = ?", [user_id])
@@ -262,8 +241,6 @@ async def webhook(request: Request):
             chat_id = msg["chat"]["id"]
             text = msg.get("text", "").strip()
 
-            log_debug(f"User {user_id} sent text: {text}")
-
             if text.startswith("/start"):
                 await query_turso(
                     "INSERT INTO users (user_id, chat_id) VALUES (?, ?) "
@@ -275,21 +252,16 @@ async def webhook(request: Request):
                 return Response(status_code=200)
 
             # Check User State
-            rows = await query_turso("SELECT state, state_data FROM user_states WHERE user_id = ?", [user_id])
-            user_row = rows[0] if rows else None
+            rows = await query_turso("SELECT state FROM user_states WHERE user_id = ?", [user_id])
+            state = rows[0][0] if rows and rows[0] else None
 
-            if not user_row or not user_row[0]:
-                await send_tg_message(chat_id, "Please select an option from the menu:", main_menu_keyboard())
-                return Response(status_code=200)
-
-            state, state_data = user_row[0], user_row[1]
-
+            # A. Add Bank
             if state == "AWAITING_ADD_BANK":
                 parts = text.split()
                 if len(parts) < 2:
                     await send_tg_message(chat_id, "❌ Send: <code>&lt;BankName&gt; &lt;Balance&gt;</code> (e.g. <code>CBE 5000</code>)", cancel_keyboard())
                     return Response(status_code=200)
-                bank_name = parts[0].strip()
+                bank_name = parts[0].capitalize()
                 try:
                     balance = float(parts[1])
                 except ValueError:
@@ -303,64 +275,78 @@ async def webhook(request: Request):
                 )
                 await query_turso("DELETE FROM user_states WHERE user_id = ?", [user_id])
                 await send_tg_message(chat_id, f"✅ Account <b>{bank_name}</b> set to <b>${balance:,.2f}</b>.", main_menu_keyboard())
+                return Response(status_code=200)
 
-            elif state == "AWAITING_SPEND":
-                bank_name = state_data
-                parts = text.split(maxsplit=1)
+            # B. Spend (or Auto-detected Expense)
+            if state == "AWAITING_SPEND" or state is None:
+                parts = text.split(maxsplit=2)
+                if len(parts) >= 2:
+                    bank_input = parts[0]
+                    # Check if first word matches a known bank
+                    accs = await query_turso(
+                        "SELECT balance, bank_name FROM accounts WHERE user_id = ? AND LOWER(bank_name) = LOWER(?)",
+                        [user_id, bank_input]
+                    )
+                    if accs:
+                        try:
+                            amount = float(parts[1])
+                            if amount <= 0:
+                                raise ValueError
+                        except ValueError:
+                            if state == "AWAITING_SPEND":
+                                await send_tg_message(chat_id, "❌ Enter a valid positive amount.", cancel_keyboard())
+                                return Response(status_code=200)
+                            amount = None
+
+                        if amount is not None:
+                            reason = parts[2] if len(parts) > 2 else "Unspecified"
+                            current_balance = float(accs[0][0])
+                            canonical_name = accs[0][1]
+                            new_balance = current_balance - amount
+
+                            await query_turso("UPDATE accounts SET balance = ? WHERE user_id = ? AND LOWER(bank_name) = LOWER(?)", [new_balance, user_id, canonical_name])
+                            await query_turso(
+                                "INSERT INTO transactions (user_id, bank_name, type, amount, description) VALUES (?, ?, 'expense', ?, ?)",
+                                [user_id, canonical_name, amount, reason]
+                            )
+                            await query_turso("DELETE FROM user_states WHERE user_id = ?", [user_id])
+                            await send_tg_message(
+                                chat_id,
+                                f"💸 <b>Expense Logged!</b>\n• Account: <b>{canonical_name}</b>\n• Amount: <b>-${amount:,.2f}</b>\n• Reason: {reason}\n• Remaining Balance: <b>${new_balance:,.2f}</b>",
+                                main_menu_keyboard()
+                            )
+                            return Response(status_code=200)
+
+            # C. Income
+            if state == "AWAITING_INCOME":
+                parts = text.split(maxsplit=2)
+                if len(parts) < 2:
+                    await send_tg_message(chat_id, "❌ Send: <code>&lt;Bank&gt; &lt;Amount&gt; &lt;Source&gt;</code>\n👉 <i>Example:</i> <code>Cbe 5000 Salary</code>", cancel_keyboard())
+                    return Response(status_code=200)
+
+                bank_input = parts[0]
+                accs = await query_turso(
+                    "SELECT balance, bank_name FROM accounts WHERE user_id = ? AND LOWER(bank_name) = LOWER(?)",
+                    [user_id, bank_input]
+                )
+                if not accs:
+                    await send_tg_message(chat_id, f"❌ Account '<b>{bank_input}</b>' not found. Check spelling.", cancel_keyboard())
+                    return Response(status_code=200)
+
                 try:
-                    amount = float(parts[0])
+                    amount = float(parts[1])
                     if amount <= 0:
                         raise ValueError
-                except (ValueError, IndexError):
-                    await send_tg_message(chat_id, "❌ Enter a valid positive amount and reason. Example: <code>150 Lunch</code>", cancel_keyboard())
+                except ValueError:
+                    await send_tg_message(chat_id, "❌ Enter a valid positive number for amount.", cancel_keyboard())
                     return Response(status_code=200)
 
-                reason = parts[1] if len(parts) > 1 else "Unspecified"
-                accs = await query_turso("SELECT balance, bank_name FROM accounts WHERE user_id = ? AND LOWER(bank_name) = LOWER(?)", [user_id, bank_name])
-                if not accs:
-                    await query_turso("DELETE FROM user_states WHERE user_id = ?", [user_id])
-                    await send_tg_message(chat_id, f"Account '{bank_name}' not found.", main_menu_keyboard())
-                    return Response(status_code=200)
-
-                current_balance = float(accs[0][0])
-                canonical_name = accs[0][1]
-                new_balance = current_balance - amount
-
-                await query_turso("UPDATE accounts SET balance = ? WHERE user_id = ? AND LOWER(bank_name) = LOWER(?)", [new_balance, user_id, bank_name])
-                await query_turso(
-                    "INSERT INTO transactions (user_id, bank_name, type, amount, description) VALUES (?, ?, 'expense', ?, ?)",
-                    [user_id, canonical_name, amount, reason]
-                )
-                await query_turso("DELETE FROM user_states WHERE user_id = ?", [user_id])
-                await send_tg_message(
-                    chat_id,
-                    f"💸 <b>Expense Logged!</b>\n• Account: <b>{canonical_name}</b>\n• Amount: <b>-${amount:,.2f}</b>\n• Reason: {reason}\n• Remaining: <b>${new_balance:,.2f}</b>",
-                    main_menu_keyboard()
-                )
-
-            elif state == "AWAITING_INCOME":
-                bank_name = state_data
-                parts = text.split(maxsplit=1)
-                try:
-                    amount = float(parts[0])
-                    if amount <= 0:
-                        raise ValueError
-                except (ValueError, IndexError):
-                    await send_tg_message(chat_id, "❌ Enter a valid positive amount and source. Example: <code>500 Salary</code>", cancel_keyboard())
-                    return Response(status_code=200)
-
-                source = parts[1] if len(parts) > 1 else "Unspecified"
-                accs = await query_turso("SELECT balance, bank_name FROM accounts WHERE user_id = ? AND LOWER(bank_name) = LOWER(?)", [user_id, bank_name])
-                if not accs:
-                    await query_turso("DELETE FROM user_states WHERE user_id = ?", [user_id])
-                    await send_tg_message(chat_id, f"Account '{bank_name}' not found.", main_menu_keyboard())
-                    return Response(status_code=200)
-
+                source = parts[2] if len(parts) > 2 else "Unspecified"
                 current_balance = float(accs[0][0])
                 canonical_name = accs[0][1]
                 new_balance = current_balance + amount
 
-                await query_turso("UPDATE accounts SET balance = ? WHERE user_id = ? AND LOWER(bank_name) = LOWER(?)", [new_balance, user_id, bank_name])
+                await query_turso("UPDATE accounts SET balance = ? WHERE user_id = ? AND LOWER(bank_name) = LOWER(?)", [new_balance, user_id, canonical_name])
                 await query_turso(
                     "INSERT INTO transactions (user_id, bank_name, type, amount, description) VALUES (?, ?, 'income', ?, ?)",
                     [user_id, canonical_name, amount, source]
@@ -371,6 +357,10 @@ async def webhook(request: Request):
                     f"💰 <b>Income Logged!</b>\n• Account: <b>{canonical_name}</b>\n• Amount: <b>+${amount:,.2f}</b>\n• Source: {source}\n• New Balance: <b>${new_balance:,.2f}</b>",
                     main_menu_keyboard()
                 )
+                return Response(status_code=200)
+
+            # Fallback if no command recognized
+            await send_tg_message(chat_id, "Please select an option from the menu:", main_menu_keyboard())
 
         # 2. Button Callback Received
         elif "callback_query" in data:
@@ -381,65 +371,52 @@ async def webhook(request: Request):
             message_id = cb["message"]["message_id"]
             cb_data = cb.get("data", "")
 
-            log_debug(f"User {user_id} clicked button: {cb_data}")
             await answer_tg_callback(cb_id)
 
             if cb_data == "btn_addbank":
+                await query_turso(
+                    "INSERT INTO user_states (user_id, state) VALUES (?, 'AWAITING_ADD_BANK') "
+                    "ON CONFLICT(user_id) DO UPDATE SET state = 'AWAITING_ADD_BANK'",
+                    [user_id]
+                )
                 await edit_tg_message(
                     chat_id,
                     message_id,
                     "🏦 <b>Add / Update Bank Account</b>\n\nSend: <code>&lt;BankName&gt; &lt;Balance&gt;</code>\n<i>Example:</i> <code>CBE 5000</code>",
                     cancel_keyboard()
                 )
-                await query_turso(
-                    "INSERT INTO user_states (user_id, state, state_data) VALUES (?, 'AWAITING_ADD_BANK', NULL) "
-                    "ON CONFLICT(user_id) DO UPDATE SET state = 'AWAITING_ADD_BANK', state_data = NULL",
-                    [user_id]
-                )
 
             elif cb_data == "btn_spend":
-                kb = await get_bank_selection_keyboard(user_id, "spend_bank")
-                if not kb:
-                    await edit_tg_message(chat_id, message_id, "⚠️ No accounts found. Tap 'Add / Edit Bank' first.", main_menu_keyboard())
-                else:
-                    await edit_tg_message(chat_id, message_id, "💸 <b>Select account spent from:</b>", kb)
+                await query_turso(
+                    "INSERT INTO user_states (user_id, state) VALUES (?, 'AWAITING_SPEND') "
+                    "ON CONFLICT(user_id) DO UPDATE SET state = 'AWAITING_SPEND'",
+                    [user_id]
+                )
+                accounts_text = await get_accounts_summary_lines(user_id)
+                msg_text = (
+                    "💸 <b>Record Expense</b>\n\n"
+                    f"<b>Your Accounts:</b>\n{accounts_text}\n\n"
+                    "Send: <code>&lt;Bank&gt; &lt;Amount&gt; &lt;Reason&gt;</code>\n"
+                    "👉 <i>Example:</i> <code>Cbe 150 Lunch with friends</code>\n"
+                    "👉 <i>Example:</i> <code>Telebirr 50 Coffee</code>"
+                )
+                await edit_tg_message(chat_id, message_id, msg_text, cancel_keyboard())
 
             elif cb_data == "btn_income":
-                kb = await get_bank_selection_keyboard(user_id, "income_bank")
-                if not kb:
-                    await edit_tg_message(chat_id, message_id, "⚠️ No accounts found. Tap 'Add / Edit Bank' first.", main_menu_keyboard())
-                else:
-                    await edit_tg_message(chat_id, message_id, "💰 <b>Select account received in:</b>", kb)
-
-            elif cb_data.startswith("spend_bank:"):
-                bank_name = cb_data.split(":", 1)[1]
-                log_debug(f"Handling spend_bank for: {bank_name}")
-                await edit_tg_message(
-                    chat_id,
-                    message_id,
-                    f"💸 <b>Selected:</b> <code>{bank_name}</code>\n\nReply with the <b>amount</b> and <b>reason</b>.\n<i>Example:</i> <code>150 Lunch with friends</code>",
-                    cancel_keyboard()
-                )
                 await query_turso(
-                    "INSERT INTO user_states (user_id, state, state_data) VALUES (?, 'AWAITING_SPEND', ?) "
-                    "ON CONFLICT(user_id) DO UPDATE SET state = 'AWAITING_SPEND', state_data = excluded.state_data",
-                    [user_id, bank_name]
+                    "INSERT INTO user_states (user_id, state) VALUES (?, 'AWAITING_INCOME') "
+                    "ON CONFLICT(user_id) DO UPDATE SET state = 'AWAITING_INCOME'",
+                    [user_id]
                 )
-
-            elif cb_data.startswith("income_bank:"):
-                bank_name = cb_data.split(":", 1)[1]
-                log_debug(f"Handling income_bank for: {bank_name}")
-                await edit_tg_message(
-                    chat_id,
-                    message_id,
-                    f"💰 <b>Selected:</b> <code>{bank_name}</code>\n\nReply with the <b>amount</b> and <b>source</b>.\n<i>Example:</i> <code>500 Freelance gig</code>",
-                    cancel_keyboard()
+                accounts_text = await get_accounts_summary_lines(user_id)
+                msg_text = (
+                    "💰 <b>Record Income</b>\n\n"
+                    f"<b>Your Accounts:</b>\n{accounts_text}\n\n"
+                    "Send: <code>&lt;Bank&gt; &lt;Amount&gt; &lt;Source&gt;</code>\n"
+                    "👉 <i>Example:</i> <code>Cbe 5000 Freelance project</code>\n"
+                    "👉 <i>Example:</i> <code>Telebirr 200 From friend</code>"
                 )
-                await query_turso(
-                    "INSERT INTO user_states (user_id, state, state_data) VALUES (?, 'AWAITING_INCOME', ?) "
-                    "ON CONFLICT(user_id) DO UPDATE SET state = 'AWAITING_INCOME', state_data = excluded.state_data",
-                    [user_id, bank_name]
-                )
+                await edit_tg_message(chat_id, message_id, msg_text, cancel_keyboard())
 
             elif cb_data == "btn_balance":
                 report = await get_balances_text(user_id)
@@ -454,31 +431,9 @@ async def webhook(request: Request):
                 await edit_tg_message(chat_id, message_id, "Action cancelled. Choose an option:", main_menu_keyboard())
 
     except Exception as e:
-        log_debug(f"Webhook Exception: {e}")
         logging.error(f"Webhook Error: {e}", exc_info=True)
 
     return Response(status_code=200)
-
-
-@app.get("/api/debug")
-@app.get("/debug")
-async def debug_endpoint():
-    db_status = "unknown"
-    accounts = []
-    try:
-        await init_db()
-        rows = await query_turso("SELECT bank_name, balance FROM accounts")
-        accounts = [{"bank": r[0], "balance": r[1]} for r in rows]
-        db_status = "connected"
-    except Exception as e:
-        db_status = f"error: {e}"
-
-    return {
-        "status": "ok",
-        "database": db_status,
-        "accounts_in_db": accounts,
-        "recent_logs": list(DEBUG_LOGS),
-    }
 
 
 @app.get("/api/daily_summary")
